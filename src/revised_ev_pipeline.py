@@ -19,7 +19,7 @@ IMPORTANT
 """
 
 from __future__ import annotations
-import os, re, heapq, warnings, json
+import os, re, heapq, json
 from pathlib import Path
 
 import numpy as np
@@ -39,14 +39,13 @@ from sklearn.metrics import (
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBRegressor
 
-warnings.filterwarnings("ignore")
 SEED = 42
-rng_global = np.random.default_rng(SEED)
+np.random.seed(SEED)
 
 # =============================================================================
 # 0. CONFIGURATION -- EDIT THIS SECTION
 # =============================================================================
-CSV_PATH = "sessions.csv"       # downloaded Dundee CSV
+CSV_PATH = os.environ.get("EV_CSV_PATH", "sessions.csv")  # private local CSV
 OUTPUT_DIR = Path("ev_revised_outputs")
 RESULTS_DIR = OUTPUT_DIR / "results"
 FIGS_DIR = OUTPUT_DIR / "figs"
@@ -73,12 +72,10 @@ DISTANCE_MAX_KM = 10.0
 DISTANCE_WEIGHTS = [1.0, 2.0, 4.0]   # minutes per km
 RANDOM_DISTANCES = True              # explicitly disclosed in outputs
 MAX_CLUSTER_SAMPLE = 20000
+EXPORT_SESSION_LEVEL_CLEANED = False  # keep session-level data local/private
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 FIGS_DIR.mkdir(parents=True, exist_ok=True)
-np.random.seed(SEED)
-
-
 # =============================================================================
 # 1. GENERAL HELPERS
 # =============================================================================
@@ -271,7 +268,8 @@ def make_original_and_cleaned(data):
         "total_charger_hours_after_cap": d1["duration_h"].sum()
     }])
     stats.to_csv(RESULTS_DIR / "table_dataset_cleaning_24h.csv", index=False)
-    d1.to_csv(RESULTS_DIR / "sessions_cleaned_cap24h.csv", index=False)
+    if EXPORT_SESSION_LEVEL_CLEANED:
+        d1.to_csv(RESULTS_DIR / "sessions_cleaned_cap24h.csv", index=False)
     return d0, d1, stats
 
 
@@ -307,18 +305,44 @@ def historical_mean_predict(train, test):
     ], dtype=float)
 
 def fit_ets_weekly(train_series, horizon):
+    """Fit additive weekly ETS; reject fits that report convergence warnings."""
+    import warnings
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
-    # Weekly seasonality for hourly data = 168 observations.
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
     model = ExponentialSmoothing(
         train_series.astype(float),
-        trend="add",
-        damped_trend=True,
+        trend=None,
         seasonal="add",
         seasonal_periods=168,
-        initialization_method="estimated"
+        initialization_method="heuristic"
     )
-    fitted = model.fit(optimized=True, use_brute=False)
-    return np.maximum(0, np.asarray(fitted.forecast(horizon), dtype=float))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fitted = model.fit(optimized=True, use_brute=True)
+
+    convergence_warnings = [
+        w for w in caught
+        if issubclass(w.category, ConvergenceWarning)
+    ]
+
+    if convergence_warnings:
+        raise RuntimeError(
+            "ETS optimisation did not converge: "
+            + "; ".join(str(w.message) for w in convergence_warnings)
+        )
+
+    # Some statsmodels versions expose the optimiser status.
+    mle_retvals = getattr(fitted, "mle_retvals", None)
+    if isinstance(mle_retvals, dict) and mle_retvals.get("success") is False:
+        raise RuntimeError("ETS optimiser returned success=False.")
+
+    forecast = np.asarray(fitted.forecast(horizon), dtype=float)
+    if not np.isfinite(forecast).all():
+        raise RuntimeError("ETS produced non-finite forecast values.")
+
+    return np.maximum(0, forecast)
 
 def expanding_window_forecasting(hourly):
     f = make_demand_features(hourly)
@@ -494,25 +518,55 @@ def waiting_summary(d):
 # 6. QUEUE-PREDICTION DATA, VALIDATION-BASED MODEL SELECTION
 # =============================================================================
 QUEUE_FEATURES = [
-    "arrivals", "arrivals_lag1", "wait_lag1",
+    "arrivals_lag1", "wait_lag1",
     "arrivals_lag24", "wait_lag24", "capacity",
     "hour", "day_of_week", "station_code"
 ]
 
 def make_station_hour_table(queued, cap_sim):
-    sh = queued.groupby(["station", "hour_ts"]).agg(
+    """Build a complete hourly station panel before calculating past-only lags.
+
+    Empty station-hours receive zero arrivals and zero mean wait. Rows with no
+    current arrivals are removed only after lag features have been calculated.
+    """
+    if queued.empty:
+        raise ValueError("Queue replay returned no sessions; cannot build station-hour data.")
+
+    start_hour = pd.Timestamp(queued["hour_ts"].min()).floor("h")
+    end_hour = pd.Timestamp(queued["hour_ts"].max()).floor("h")
+    hours = pd.date_range(start_hour, end_hour, freq="h")
+    stations = sorted(queued["station"].astype(str).unique())
+    full_index = pd.MultiIndex.from_product(
+        [stations, hours], names=["station", "hour_ts"]
+    )
+
+    observed = queued.groupby(["station", "hour_ts"]).agg(
         arrivals=("wait_min", "size"),
         target_wait=("wait_min", "mean")
-    ).reset_index().sort_values(["station", "hour_ts"])
+    )
+    sh = observed.reindex(full_index).reset_index()
+    sh["arrivals"] = sh["arrivals"].fillna(0).astype(int)
+    sh["target_wait"] = sh["target_wait"].fillna(0.0)
     sh["capacity"] = sh["station"].map(cap_sim).astype(float)
     sh["hour"] = sh["hour_ts"].dt.hour
     sh["day_of_week"] = sh["hour_ts"].dt.dayofweek
-    sh["station_code"] = sh["station"].astype("category").cat.codes
-    sh["arrivals_lag1"] = sh.groupby("station")["arrivals"].shift(1)
-    sh["wait_lag1"] = sh.groupby("station")["target_wait"].shift(1)
-    sh["arrivals_lag24"] = sh.groupby("station")["arrivals"].shift(24)
-    sh["wait_lag24"] = sh.groupby("station")["target_wait"].shift(24)
-    sh[QUEUE_FEATURES] = sh[QUEUE_FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0)
+    station_codes = {name: i for i, name in enumerate(stations)}
+    sh["station_code"] = sh["station"].map(station_codes).astype(int)
+
+    sh = sh.sort_values(["station", "hour_ts"]).reset_index(drop=True)
+    grouped = sh.groupby("station", sort=False)
+    sh["arrivals_lag1"] = grouped["arrivals"].shift(1)
+    sh["wait_lag1"] = grouped["target_wait"].shift(1)
+    sh["arrivals_lag24"] = grouped["arrivals"].shift(24)
+    sh["wait_lag24"] = grouped["target_wait"].shift(24)
+    sh[QUEUE_FEATURES] = (
+        sh[QUEUE_FEATURES]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
+    )
+
+    # The target is defined only for station-hours with at least one arrival.
+    sh = sh.loc[sh["arrivals"] > 0].copy()
     return sh.sort_values(["hour_ts", "station"]).reset_index(drop=True)
 
 def make_queue_model(name):
@@ -542,48 +596,61 @@ def sakasegawa_prediction(frame, mean_service_hours, max_train_wait):
     return np.minimum(pred, max_train_wait)
 
 def train_validate_test_queue(sh, train_fraction=TRAIN_FRACTION):
-    # Chronological split by timestamp, not by arbitrary row order.
-    unique_times = np.array(sorted(sh.hour_ts.unique()))
-    cut_pos = max(1, int(len(unique_times) * train_fraction))
-    test_start = unique_times[cut_pos]
-    train_all = sh[sh.hour_ts < test_start].copy()
-    test = sh[sh.hour_ts >= test_start].copy()
+    """Chronological train/validation/test split by unique hourly timestamps."""
+    if sh.empty:
+        raise ValueError("Station-hour training table is empty.")
 
-    # Last 10% of the training period is validation only.
-    train_times = np.array(sorted(train_all.hour_ts.unique()))
-    val_pos = max(1, int(len(train_times) * 0.90))
+    unique_times = np.array(sorted(pd.to_datetime(sh["hour_ts"].unique())))
+    if len(unique_times) < 3:
+        raise ValueError(
+            f"Need at least 3 unique timestamps for chronological queue evaluation; got {len(unique_times)}."
+        )
+
+    cut_pos = int(len(unique_times) * train_fraction)
+    cut_pos = min(max(cut_pos, 2), len(unique_times) - 1)
+    test_start = unique_times[cut_pos]
+    train_all = sh.loc[sh["hour_ts"] < test_start].copy()
+    test = sh.loc[sh["hour_ts"] >= test_start].copy()
+
+    train_times = np.array(sorted(pd.to_datetime(train_all["hour_ts"].unique())))
+    if len(train_times) < 2 or train_all.empty or test.empty:
+        raise ValueError("Insufficient chronological data for queue train/validation/test split.")
+
+    # Reserve the final 10% of the pre-test training period for model selection.
+    val_pos = int(np.floor(len(train_times) * 0.90))
+    val_pos = min(max(val_pos, 1), len(train_times) - 1)
     val_start = train_times[val_pos]
-    train = train_all[train_all.hour_ts < val_start].copy()
-    val = train_all[train_all.hour_ts >= val_start].copy()
+    train = train_all.loc[train_all["hour_ts"] < val_start].copy()
+    val = train_all.loc[train_all["hour_ts"] >= val_start].copy()
+    if train.empty or val.empty:
+        raise ValueError("Chronological queue validation split produced an empty partition.")
 
     candidates = ["Linear Regression", "Random Forest", "XGBoost"]
     validation_rows = []
     for name in candidates:
         model = make_queue_model(name)
         model.fit(train[QUEUE_FEATURES], train["target_wait"])
-        p = np.maximum(0, model.predict(val[QUEUE_FEATURES]))
+        pred = np.maximum(0, model.predict(val[QUEUE_FEATURES]))
         validation_rows.append({
             "model": name,
-            **regression_metrics(val["target_wait"], p)
+            **regression_metrics(val["target_wait"], pred)
         })
-    validation_table = pd.DataFrame(validation_rows).sort_values("RMSE")
-    selected = validation_table.iloc[0]["model"]
 
+    validation_table = pd.DataFrame(validation_rows).sort_values("RMSE").reset_index(drop=True)
+    selected = str(validation_table.iloc[0]["model"])
+    selected_val_rmse = float(
+        validation_table.loc[validation_table["model"] == selected, "RMSE"].iloc[0]
+    )
+
+    # Refit the validation-selected model on all pre-test observations.
     final_model = make_queue_model(selected)
     final_model.fit(train_all[QUEUE_FEATURES], train_all["target_wait"])
-    test_pred = np.maximum(0, final_model.predict(test[QUEUE_FEATURES]))
-
-    mean_service = float(
-        train_all["target_wait"].mean() * 0 + 1
-    )
-    # Use mean duration from original session records in caller; this is replaced
-    # below by the station-hour proxy only if not passed. Formula is a comparator.
-    formula_pred = None
-
     test = test.copy()
-    test["pred_wait"] = test_pred
+    test["pred_wait"] = np.maximum(0, final_model.predict(test[QUEUE_FEATURES]))
+
     return {
         "selected_model": selected,
+        "selected_model_validation_RMSE": selected_val_rmse,
         "validation_table": validation_table,
         "train_all": train_all,
         "test": test,
@@ -678,38 +745,108 @@ def session_profiling(original):
 # =============================================================================
 # 8. RECOMMENDATION EXPERIMENT + PAIRED BOOTSTRAP
 # =============================================================================
-def paired_bootstrap_recommendation(nearest_wait, proposed_wait, reps=BOOTSTRAP_REPS,
-                                    seed=SEED):
-    nw = np.asarray(nearest_wait, dtype=float)
-    pw = np.asarray(proposed_wait, dtype=float)
-    n = len(nw)
-    if n == 0:
-        return {}
-    point_near = nw.mean()
-    point_prop = pw.mean()
-    point_reduction = (
-        (point_near - point_prop) / point_near * 100 if point_near > 0 else np.nan
+
+def paired_bootstrap_recommendation(
+    nearest_wait,
+    proposed_wait,
+    hour_ts,
+    reps=BOOTSTRAP_REPS,
+    block_len=BLOCK_LENGTH_HOURS,
+    seed=SEED
+):
+    """Paired circular moving-block bootstrap over test hours."""
+
+    trial_data = pd.DataFrame({
+        "hour_ts": pd.to_datetime(hour_ts),
+        "nearest_wait": np.asarray(nearest_wait, dtype=float),
+        "proposed_wait": np.asarray(proposed_wait, dtype=float)
+    })
+
+    # Average repeated trials within each test hour.
+    hourly = (
+        trial_data.groupby("hour_ts")[["nearest_wait", "proposed_wait"]]
+        .mean()
+        .sort_index()
     )
-    r = np.random.default_rng(seed)
-    boot_near = np.empty(reps)
-    boot_prop = np.empty(reps)
-    boot_red = np.empty(reps)
-    for b in range(reps):
-        ix = r.integers(0, n, n)
-        a, z = nw[ix].mean(), pw[ix].mean()
-        boot_near[b], boot_prop[b] = a, z
-        boot_red[b] = (a - z) / a * 100 if a > 0 else np.nan
+
+    if hourly.empty:
+        return {}
+
+    # Preserve gaps in the hourly timeline; missing hours remain NaN.
+    full_index = pd.date_range(
+        hourly.index.min().floor("h"),
+        hourly.index.max().floor("h"),
+        freq="h"
+    )
+    hourly = hourly.reindex(full_index)
+
+    nw = hourly["nearest_wait"].to_numpy(dtype=float)
+    pw = hourly["proposed_wait"].to_numpy(dtype=float)
+    n = len(hourly)
+
+    valid = np.isfinite(nw) & np.isfinite(pw)
+    if not valid.any():
+        return {}
+
+    point_near = float(np.nanmean(nw))
+    point_prop = float(np.nanmean(pw))
+    point_reduction = (
+        (point_near - point_prop) / point_near * 100
+        if point_near > 0 else np.nan
+    )
+
+    L = max(1, min(int(block_len), n))
+    n_blocks = int(np.ceil(n / L))
+    rng = np.random.default_rng(seed)
+
+    boot_near = []
+    boot_prop = []
+    boot_reduction = []
+
+    for _ in range(reps):
+        starts = rng.integers(0, n, size=n_blocks)
+        indices = np.concatenate([
+            (start + np.arange(L)) % n for start in starts
+        ])[:n]
+
+        sampled_near = nw[indices]
+        sampled_prop = pw[indices]
+
+        paired_valid = (
+            np.isfinite(sampled_near) & np.isfinite(sampled_prop)
+        )
+        if not paired_valid.any():
+            continue
+
+        mean_near = float(np.mean(sampled_near[paired_valid]))
+        mean_prop = float(np.mean(sampled_prop[paired_valid]))
+
+        boot_near.append(mean_near)
+        boot_prop.append(mean_prop)
+        boot_reduction.append(
+            (mean_near - mean_prop) / mean_near * 100
+            if mean_near > 0 else np.nan
+        )
+
+    if not boot_near:
+        return {}
+
     return {
         "nearest_mean_wait": point_near,
-        "nearest_wait_ci_low": np.nanquantile(boot_near, .025),
-        "nearest_wait_ci_high": np.nanquantile(boot_near, .975),
+        "nearest_wait_ci_low": float(np.nanquantile(boot_near, 0.025)),
+        "nearest_wait_ci_high": float(np.nanquantile(boot_near, 0.975)),
         "queue_aware_mean_wait": point_prop,
-        "queue_aware_wait_ci_low": np.nanquantile(boot_prop, .025),
-        "queue_aware_wait_ci_high": np.nanquantile(boot_prop, .975),
+        "queue_aware_wait_ci_low": float(np.nanquantile(boot_prop, 0.025)),
+        "queue_aware_wait_ci_high": float(np.nanquantile(boot_prop, 0.975)),
         "reduction_percent": point_reduction,
-        "reduction_ci_low": np.nanquantile(boot_red, .025),
-        "reduction_ci_high": np.nanquantile(boot_red, .975)
+        "reduction_ci_low": float(np.nanquantile(boot_reduction, 0.025)),
+        "reduction_ci_high": float(np.nanquantile(boot_reduction, 0.975)),
+        "eligible_test_hours": int(valid.sum()),
+        "bootstrap_method": "paired_circular_moving_block_by_test_hour",
+        "bootstrap_block_length_hours": L,
+        "bootstrap_repetitions": len(boot_near)
     }
+
 
 def recommendation_trials(test_station_hours, weight, n_trials=N_RECOMMENDATION_TRIALS,
                           seed=SEED):
@@ -723,8 +860,10 @@ def recommendation_trials(test_station_hours, weight, n_trials=N_RECOMMENDATION_
     r = np.random.default_rng(seed)
     nearest_wait, proposed_wait = [], []
     nearest_total, proposed_total = [], []
+    trial_hours = []
     for _ in range(n_trials):
         g0 = groups[int(r.integers(0, len(groups)))]
+        trial_hours.append(pd.Timestamp(g0["hour_ts"].iloc[0]))
         take = r.choice(len(g0), size=3, replace=False)
         g = g0.iloc[take]
         distances = r.uniform(DISTANCE_MIN_KM, DISTANCE_MAX_KM, size=3)
@@ -735,7 +874,14 @@ def recommendation_trials(test_station_hours, weight, n_trials=N_RECOMMENDATION_
         proposed_wait.append(float(g["target_wait"].iloc[proposed_idx]))
         nearest_total.append(float(g["target_wait"].iloc[nearest_idx] + travel[nearest_idx]))
         proposed_total.append(float(g["target_wait"].iloc[proposed_idx] + travel[proposed_idx]))
-    result = paired_bootstrap_recommendation(nearest_wait, proposed_wait, seed=seed)
+    result = paired_bootstrap_recommendation(
+    nearest_wait,
+    proposed_wait,
+    trial_hours,
+    reps=BOOTSTRAP_REPS,
+    block_len=BLOCK_LENGTH_HOURS,
+    seed=seed
+)
     result.update({
         "distance_weight_min_per_km": weight,
         "trials": n_trials,
@@ -769,9 +915,10 @@ def run_queue_scenario(data_version, data, factor):
     # Test metrics only after selection on validation.
     queue_metrics = regression_metrics(test["target_wait"], test["pred_wait"])
     queue_metrics.update({
+        "model": fitted["selected_model"],
         "dataset_version": data_version,
         "capacity_factor": factor,
-        "selected_model_validation_RMSE": fitted["selected_model"]
+        "selected_model_validation_RMSE": fitted["selected_model_validation_RMSE"]
     })
     # Keep the queue formula as a benchmark, using training-period mean service time.
     train_sessions = queued[queued.hour_ts < test.hour_ts.min()]
@@ -781,13 +928,11 @@ def run_queue_scenario(data_version, data, factor):
     )
     formula_metrics = regression_metrics(test["target_wait"], formula_pred)
     formula_metrics.update({
-        "model": "M/M/c approximation",
+        "model": "Sakasegawa-style queue approximation",
         "dataset_version": data_version,
         "capacity_factor": factor,
         "selected_model_validation_RMSE": ""
     })
-    queue_metrics["model"] = fitted["selected_model"]
-
     # Attach formula and learned model results.
     metrics_rows = [queue_metrics, formula_metrics]
     # Evaluate other learned models on test for a complete Table III.
@@ -988,9 +1133,13 @@ def main():
         "queue_discipline": "FCFS",
         "recommendation_trials": N_RECOMMENDATION_TRIALS,
         "bootstrap_repetitions": BOOTSTRAP_REPS,
-        "recommendation_distance_method": "Random distances uniformly drawn from 0.5 to 10 km",
+        "recommendation_distance_method": "Random distances uniformly drawn from 0.5 to 10 km; not postcode-derived or geographic distances",
         "recommendation_weights_min_per_km": DISTANCE_WEIGHTS,
-        "queue_model_selection": "Last 10% of chronological training period used as validation",
+        "session_level_cleaned_export_enabled": EXPORT_SESSION_LEVEL_CLEANED,
+        "queue_model_selection": "Chronological split; final 10% of pre-test period used for validation; selected model refit on all pre-test data",
+        "queue_prediction_protocol": "Rolling one-hour-ahead evaluation; prior-hour observed queue outcomes are used as lag features",
+        "empty_station_hour_convention": "Zero arrivals and zero mean wait; lag features computed on complete hourly station panels",
+        "queue_capacity_assumption": "Station-level capacity is a scaled estimate based on maximum observed concurrency; connector compatibility is not modelled",
         "forecast_validation": "Five expanding-window chronological test periods",
         "forecast_weekly_baselines": ["Seasonal naive lag 168", "ETS seasonal period 168"],
         "license_note": "Dundee catalogue lists no licence; obtain direct confirmation before publication"
